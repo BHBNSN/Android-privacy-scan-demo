@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "name": "Check.WrapperInterfaceJadx",
+  "description": "从单个 method 出发，判定其是否为“封装的通用接口/通用 wrapper”，为后续使用场景审计提供可信入口。",
+  "phases": {
+    "scan": {
+      "goal": "从单个 entry_point 出发，判定该方法是否为通用封装接口（wrapper）",
+      "inputs": ["entry_point"],
+      "method": "wrapper_interface_check",
+      "rules": [
+        "只分析这一个 entry_point：{entry_point}",
+        "必须先 load(input_file) 并记录 instanceId",
+        "必须使用 JADX/MCP 获取 entry_point 的反编译代码（get_method_decompiled_code 或等价工具）",
+        "如果反编译失败，必须尝试用“列出类方法/搜索签名/纠正类名”的方式修正 entry_point；若工具不可用则输出无法判定并说明原因",
+        "尽可能获取 entry_point 的调用者信息（get_method_callers 或等价工具），用于判断通用性；若无法获取，需要明确标注缺失",
+        "必须输出 is_wrapper_interface（true/false）或在无法判定时输出 null",
+        "必须提供可复核的证据：关键代码片段 + 关键调用（被封装的目标 API/SDK/内部模块）"
+      ],
+      "output": {
+        "format": "json",
+        "schema": {
+          "entry_point": "string",
+          "is_wrapper_interface": "boolean|null",
+          "confidence": "number",
+          "evidence": ["string"],
+          "callers": ["string"],
+          "key_snippet": "string"
+        }
+      }
+    }
+  }
+}
