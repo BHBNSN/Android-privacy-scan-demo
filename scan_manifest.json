@@ -1,12 +1,8 @@
 {
     "version": 1.0,
-    "permission_search_map": {
-        "location": [
-            "location.getProvider"
-        ],
-        "clipboard": [
-            "ClipboardManager"
-        ]
+    "permission_workflows": {
+        "location": "workflows/location.workflow.json",
+        "clipboard": "workflows/clipboard.workflow.json"
     },
     "recursion_limits": {
         "max_depth": 5,

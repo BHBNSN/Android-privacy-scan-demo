@@ -1,0 +1,43 @@
+{
+  "version": 1,
+  "permission": "clipboard",
+  "search_strings": [
+    "ClipboardManager",
+    "getPrimaryClip(",
+    "getText(",
+    "getPrimaryClipDescription("
+  ],
+  "api_docs": {
+    "ClipboardManager": {
+      "api": "android.content.ClipboardManager (class)",
+      "inputs": "通过 Context.getSystemService 获取",
+      "outputs": "提供剪贴板读写接口",
+      "meaning": "系统剪贴板服务对象，用于读取或写入剪贴板内容。",
+      "notes": "场景合规通常要求用户主动触发（粘贴/点击按钮），并限制读取时机与数据去向。"
+    },
+    "getPrimaryClip(": {
+      "api": "android.content.ClipboardManager#getPrimaryClip()",
+      "inputs": "无",
+      "outputs": "ClipData：剪贴板当前主内容",
+      "meaning": "读取剪贴板内容载体（可能包含文本、URI、Intent 等）。",
+      "notes": "敏感：可能包含用户隐私/验证码/账号信息；重点看触发条件、是否上传/记录。"
+    },
+    "getText(": {
+      "api": "android.content.ClipData.Item#getText()",
+      "inputs": "ClipData.Item",
+      "outputs": "CharSequence：剪贴板文本（若存在）",
+      "meaning": "从剪贴板条目中取出文本内容。",
+      "notes": "敏感：直接得到可读文本；需要审计是否在后台/无交互场景读取。"
+    },
+    "getPrimaryClipDescription(": {
+      "api": "android.content.ClipboardManager#getPrimaryClipDescription()",
+      "inputs": "无",
+      "outputs": "ClipDescription：描述信息（MIME 类型、标签等）",
+      "meaning": "获取剪贴板内容的描述（不一定包含正文）。",
+      "notes": "可能用于判断剪贴板类型；与 getPrimaryClip 联用可构成更强的读取能力。"
+    }
+  },
+  "scenario_check": {
+    "system_prompt": "你是一名精通 Android 剪贴板访问使用场景审计的专家。你必须使用 JADX MCP 基于反编译代码判断某个方法/调用链是否属于允许的使用场景。\n\n【输入】\n- APK: `{input_file}`\n- instanceId: `{instanceId}`（必须复用，不要再次 load）\n- permission: `{permission}`\n- 需要审计的方法(顶层非通用方法): `{entry_point}`\n- 允许的场景列表(JSON): `{scenarios_json}`\n- 该方法关联的调用链/命中信息(JSON): `{context_json}`\n- 命中 API 的文档说明(JSON): `{api_docs_json}`\n\n【剪贴板审计要点】\n- 结合 api_docs_json 中的输入/输出含义，识别是否读取剪贴板内容（PrimaryClip/Text/Description），以及触发时机（用户主动粘贴/点击/输入框聚焦/后台轮询等）。\n- 识别数据去向：是否写日志、上传网络、写入本地、传给第三方 SDK。\n\n【工作流约束】\n- 必须使用 JADX MCP 获取 `{entry_point}` 的反编译代码（get_method_decompiled_code 或等价工具）。\n- 尽可能获取读剪贴板的关键调用片段，并说明触发条件。\n- 不允许凭空推断；证据不足则输出无法判定。\n\n【输出】\n输出严格 JSON（不要 Markdown），字段如下：\n- entry_point: string\n- permission: string\n- verdict: string（仅允许：\"符合声明\" / \"不符合声明\" / \"无法判定\"）\n- matched_scenarios: array of string\n- confidence: number（0~1）\n- evidence: array of string\n- issues: array of string\n"
+  }
+}

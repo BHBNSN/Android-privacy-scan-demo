@@ -61,6 +61,17 @@ def _build_bootstrap_prompt(apk_path: str) -> str:
     )
 
 
+def _build_scenario_prompt(system_prompt: str, rules: list[str], variables: dict[str, Any]) -> str:
+    base = _render_template(system_prompt, variables)
+    constraints = "\n".join(f"- {r}" for r in rules or [])
+    return (
+        f"{base}\n\n"
+        f"必须遵守以下规则：\n{constraints}\n\n"
+        "【输出格式要求】\n"
+        "- 必须输出严格 JSON（不要 Markdown 代码块）\n"
+    )
+
+
 def _get_recursion_limits(scan_manifest: dict) -> dict[str, int]:
     limits = scan_manifest.get("recursion_limits") or {}
     max_depth = int(limits.get("max_depth") or 5)
@@ -98,6 +109,11 @@ async def main():
     parser.add_argument("--jadx-host", default=os.getenv("JADX_DAEMON_MCP_HOST", "localhost"))
     parser.add_argument("--base-url", default=os.getenv("OPENAI_BASE_URL", "https://www.dmxapi.cn/v1"))
     parser.add_argument("--model", default=os.getenv("OPENAI_MODEL", "GLM-4.5-Flash"))
+    parser.add_argument(
+        "--scenarios",
+        default="D:\PyCharmProject\Android-privacy-scan\per.json",
+        help="可选：外部输入的使用场景 JSON 文件路径（permission -> 场景列表）。提供后将执行场景符合性审计。",
+    )
     args = parser.parse_args()
 
     # Define the MCP server configuration
@@ -119,11 +135,36 @@ async def main():
         raise RuntimeError("未检测到 OPENAI_API_KEY（或 DMX_API_KEY）环境变量。")
 
     scan_manifest = _read_json_file(args.scan_manifest)
+    permission_workflows = scan_manifest.get("permission_workflows") or {}
     permission_search_map = scan_manifest.get("permission_search_map") or {}
+
+    per_permission_workflow: dict[str, dict[str, Any]] = {}
+    per_permission_api_docs: dict[str, dict[str, Any]] = {}
+    if isinstance(permission_workflows, dict) and permission_workflows:
+        for permission, workflow_path in permission_workflows.items():
+            if not workflow_path:
+                continue
+            wf = _read_json_file(str(workflow_path))
+            per_permission_workflow[str(permission)] = wf
+            api_docs = wf.get("api_docs")
+            if isinstance(api_docs, dict):
+                per_permission_api_docs[str(permission)] = api_docs
+            else:
+                per_permission_api_docs[str(permission)] = {}
+        # 从 workflow 文件中提取搜索字符串
+        derived_map: dict[str, list[str]] = {}
+        for permission, wf in per_permission_workflow.items():
+            search_strings = wf.get("search_strings")
+            if isinstance(search_strings, list) and search_strings:
+                derived_map[permission] = [str(s) for s in search_strings if str(s).strip()]
+            else:
+                derived_map[permission] = []
+        permission_search_map = derived_map
+
     if not isinstance(permission_search_map, dict) or not permission_search_map:
         raise RuntimeError(
-            "scan_manifest.json 未配置 permission_search_map。\n"
-            "请按 {permission: [searchString,...]} 的结构配置，例如：{\"location\":[\"location.get\"]}"
+            "scan_manifest.json 未配置 permission_workflows 或 permission_search_map。\n"
+            "推荐使用 permission_workflows: {permission: workflow_json_path}"
         )
 
     recursion_limits = _get_recursion_limits(scan_manifest)
@@ -230,7 +271,7 @@ async def main():
             queue: deque[tuple[str, str, list[dict[str, Any]], int]] = deque()
             visited: set[tuple[str, str]] = set()
 
-            for origin_method, hit_strings in (methods_dict or {}).items():
+            for origin_method, _hit_list in (methods_dict or {}).items():
                 queue.append((origin_method, origin_method, [], 0))
                 visited.add((origin_method, origin_method))
 
@@ -322,6 +363,73 @@ async def main():
                 "roots": roots,
                 "undetermined": undetermined,
             }
+
+        # Phase 3 (optional): 使用场景符合性审计
+        scenarios_by_permission: dict[str, Any] = {}
+        if args.scenarios:
+            scenarios_by_permission = _read_json_file(args.scenarios)
+
+        if scenarios_by_permission:
+            for permission, payload in final_report.items():
+                scenarios = scenarios_by_permission.get(permission)
+                if not isinstance(scenarios, list) or not scenarios:
+                    continue
+
+                wf = per_permission_workflow.get(permission) or {}
+                scenario_cfg = wf.get("scenario_check") or {}
+                scenario_prompt_template = scenario_cfg.get("system_prompt")
+                if not isinstance(scenario_prompt_template, str) or not scenario_prompt_template.strip():
+                    # 没有配置场景工作流则跳过
+                    continue
+
+                roots_obj = payload.get("roots") or {}
+                for root_method, root_info in roots_obj.items():
+                    # 根据 origins 的 hits 计算需要注入的 API 文档（只注入命中的那部分）
+                    api_docs_all = per_permission_api_docs.get(permission) or {}
+                    hit_strings: set[str] = set()
+                    for origin_item in (root_info.get("origins") or []):
+                        for s in (origin_item.get("hits") or []):
+                            hit_strings.add(str(s))
+                    api_docs_used = {k: api_docs_all.get(k) for k in hit_strings if api_docs_all.get(k) is not None}
+
+                    context_obj = {
+                        "permission": permission,
+                        "root_method": root_method,
+                        "origins": root_info.get("origins") or [],
+                        "api_hits": sorted(list(hit_strings)),
+                    }
+                    variables = {
+                        "input_file": args.apk,
+                        "instanceId": instance_id,
+                        "permission": permission,
+                        "entry_point": root_method,
+                        "scenarios_json": json.dumps(scenarios, ensure_ascii=False),
+                        "context_json": json.dumps(context_obj, ensure_ascii=False),
+                        "api_docs_json": json.dumps(api_docs_used, ensure_ascii=False),
+                    }
+                    scenario_prompt = _build_scenario_prompt(
+                        system_prompt=scenario_prompt_template,
+                        rules=scan_manifest.get("rules", []),
+                        variables=variables,
+                    )
+
+                    resp = await agent.arun(scenario_prompt)
+                    txt = getattr(resp, "content", None) or str(resp)
+                    scenario_result: dict[str, Any]
+                    try:
+                        scenario_result = _extract_first_json_object(txt)
+                    except Exception:
+                        scenario_result = {
+                            "entry_point": root_method,
+                            "permission": permission,
+                            "verdict": "无法判定",
+                            "matched_scenarios": [],
+                            "confidence": 0.0,
+                            "evidence": ["模型输出无法解析为 JSON", txt[:5000]],
+                            "issues": ["模型输出格式错误"],
+                        }
+
+                    root_info["scenario_check"] = scenario_result
 
         print(json.dumps(final_report, ensure_ascii=False))
 
