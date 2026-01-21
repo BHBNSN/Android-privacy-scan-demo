@@ -1,17 +1,32 @@
 import asyncio
-from agno.agent import Agent
-from agno.models.openai import OpenAIChat
-from agno.tools.mcp import MCPTools
-from mcp import StdioServerParameters
 import os
 import argparse
 import json
 import re
-from typing import Any
+from dataclasses import dataclass
+from typing import Any, Optional
 
-from collections import deque
+import requests
+
+from agno.agent import Agent  # type: ignore
+from agno.models.openai import OpenAIChat  # type: ignore
+from agno.tools.mcp import MCPTools  # type: ignore
+from mcp import StdioServerParameters  # type: ignore
+_HAS_AGNO = True
 
 from get_permisson_methods import collect_permission_methods
+
+
+SCAN_MANIFEST_PATH = "scan_manifest.json"
+SCENARIOS_PATH = "per.json"
+JADX_DAEMON_URL = "http://localhost:8651"
+
+# 权限检测顺序（避免混淆）
+PERMISSION_ORDER = ["location", "clipboard"]
+
+
+def _log(msg: str) -> None:
+    print(msg, flush=True)
 
 
 def _read_json_file(path: str) -> dict:
@@ -40,25 +55,52 @@ def _extract_first_json_object(text: str) -> dict:
     return json.loads(match.group(0))
 
 
-def _build_scan_prompt(scan_manifest: dict, variables: dict[str, Any]) -> str:
-    base = _render_template(scan_manifest["system_prompt"], variables)
-    constraints = "\n".join(f"- {r}" for r in scan_manifest.get("rules", []))
-    return (
-        f"{base}\n\n"
-        f"必须遵守以下规则：\n{constraints}\n\n"
-        "【输出格式要求】\n"
-        "- 必须输出严格 JSON（不要 Markdown 代码块）\n"
-        "- JSON 必须包含字段：entry_point, is_wrapper_interface, confidence, evidence, callers\n"
-    )
+def _safe_get_json(resp: requests.Response) -> dict:
+    try:
+        return resp.json() or {}
+    except Exception:
+        return {}
 
 
-def _build_bootstrap_prompt(apk_path: str) -> str:
-    return (
-        "你需要通过 jadx MCP 初始化反编译上下文。\n"
-        f"待分析的二进制文件路径是: `{apk_path}`。\n"
-        "你必须调用 load(filePath) 加载该文件，并输出严格 JSON（不要 Markdown 代码块），格式为："
-        '{"instanceId":"..."}'
+def _jadx_load(*, jadx_daemon_url: str, apk_path: str) -> str:
+    data = _safe_get_json(
+        requests.get(
+            f"{jadx_daemon_url}/load",
+            params={"filePath": apk_path},
+            timeout=120,
+        )
     )
+    instance_id = str(data.get("result") or "").strip()
+    if not instance_id:
+        raise RuntimeError("JADX daemon load() 未返回有效 instanceId")
+    return instance_id
+
+
+@dataclass
+class OpenAICompatClient:
+    base_url: str
+    api_key: str
+    model: str
+
+    def chat(self, *, prompt: str) -> str:
+        url = self.base_url.rstrip("/") + "/chat/completions"
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+        }
+        payload = {
+            "model": self.model,
+            "messages": [
+                {"role": "user", "content": prompt},
+            ],
+            "temperature": 0.2,
+        }
+        resp = requests.post(url, headers=headers, json=payload, timeout=180)
+        data = _safe_get_json(resp)
+        try:
+            return str(data["choices"][0]["message"]["content"])
+        except Exception:
+            raise RuntimeError(f"LLM 返回异常: {data}")
 
 
 def _build_scenario_prompt(system_prompt: str, rules: list[str], variables: dict[str, Any]) -> str:
@@ -84,49 +126,47 @@ def _get_recursion_limits(scan_manifest: dict) -> dict[str, int]:
     }
 
 
-def _as_bool_or_none(value: Any) -> bool | None:
-    if value is None:
-        return None
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, str):
-        if value.lower() in {"true", "yes", "1"}:
-            return True
-        if value.lower() in {"false", "no", "0"}:
-            return False
-    return None
+def _build_global_scenario_prefix(scan_manifest: dict) -> str:
+    """Global prefix for scenario checking prompts (non-authoritative)."""
+    prefix = scan_manifest.get("scenario_global_prompt")
+    if isinstance(prefix, str) and prefix.strip():
+        return prefix.strip()
+    # fallback (keep concise)
+    return (
+        "【全局约束补充】\n"
+        "- 你收到的 context_json 是自动预提取的调用链/命中信息，可能因匿名类/反射/动态代理/跨进程等原因不完整。\n"
+        "- 不得把 context_json 当成完整事实；必须在需要时继续使用 JADX MCP 追踪/搜索/反编译以补全证据。\n"
+    )
 
 async def main():
-    parser = argparse.ArgumentParser(description="Android wrapper check agent")
+    parser = argparse.ArgumentParser(description="Android privacy scenario audit agent")
     parser.add_argument("--apk", required=True, help="待分析的 APK 路径")
-    # 其余参数保持可选（不要求命令行提供），默认从环境变量读取
-    parser.add_argument("--scan-manifest", default=os.getenv("SCAN_MANIFEST", "scan_manifest.json"))
-    parser.add_argument("--workflow", default=os.getenv("PRISCAN_WORKFLOW", "priscan_workflow.json"))
-    parser.add_argument(
-        "--jadx-mcp-server",
-        default=os.getenv("JADX_MCP_SERVER", "D:\\JAVAProjects\\jadx-daemon-mcp\\server.py"),
-    )
-    parser.add_argument("--jadx-host", default=os.getenv("JADX_DAEMON_MCP_HOST", "localhost"))
-    parser.add_argument("--base-url", default=os.getenv("OPENAI_BASE_URL", "https://www.dmxapi.cn/v1"))
-    parser.add_argument("--model", default=os.getenv("OPENAI_MODEL", "GLM-4.5-Flash"))
-    parser.add_argument(
-        "--scenarios",
-        default="D:\PyCharmProject\Android-privacy-scan\per.json",
-        help="可选：外部输入的使用场景 JSON 文件路径（permission -> 场景列表）。提供后将执行场景符合性审计。",
-    )
     args = parser.parse_args()
 
-    # Define the MCP server configuration
-    server_params = StdioServerParameters(
-        command="python",
-        args=[args.jadx_mcp_server],
-        env={"JADX_DAEMON_MCP_HOST": args.jadx_host},
-    )
+    # 运行配置（写死，避免命令行参数混淆）
+    scan_manifest_path = SCAN_MANIFEST_PATH
+    scenarios_path = SCENARIOS_PATH
+    jadx_daemon_url = JADX_DAEMON_URL
 
-    mcp_tools = MCPTools(
-        transport="stdio",
-        server_params=server_params
-    )
+    llm_base_url = os.getenv("OPENAI_BASE_URL", "https://www.dmxapi.cn/v1")
+    llm_model = os.getenv("OPENAI_MODEL", "GLM-4.5-Flash")
+
+    mcp_tools = None
+    if _HAS_AGNO:
+        assert StdioServerParameters is not None
+        assert MCPTools is not None
+        jadx_mcp_server = os.getenv("JADX_MCP_SERVER", r"D:\\JAVAProjects\\jadx-daemon-mcp\\server.py")
+        jadx_host = os.getenv("JADX_DAEMON_MCP_HOST", "localhost")
+        # Define the MCP server configuration
+        server_params = StdioServerParameters(
+            command="python",
+            args=[jadx_mcp_server],
+            env={"JADX_DAEMON_MCP_HOST": jadx_host},
+        )
+        mcp_tools = MCPTools(
+            transport="stdio",
+            server_params=server_params,
+        )
 
     # Initialize the Agent with the MCP tools
     # IMPORTANT: never hard-code API keys in source code.
@@ -134,304 +174,204 @@ async def main():
     if not api_key:
         raise RuntimeError("未检测到 OPENAI_API_KEY（或 DMX_API_KEY）环境变量。")
 
-    scan_manifest = _read_json_file(args.scan_manifest)
+    scan_manifest = _read_json_file(scan_manifest_path)
     permission_workflows = scan_manifest.get("permission_workflows") or {}
-    permission_search_map = scan_manifest.get("permission_search_map") or {}
-
-    per_permission_workflow: dict[str, dict[str, Any]] = {}
-    per_permission_api_docs: dict[str, dict[str, Any]] = {}
-    if isinstance(permission_workflows, dict) and permission_workflows:
-        for permission, workflow_path in permission_workflows.items():
-            if not workflow_path:
-                continue
-            wf = _read_json_file(str(workflow_path))
-            per_permission_workflow[str(permission)] = wf
-            api_docs = wf.get("api_docs")
-            if isinstance(api_docs, dict):
-                per_permission_api_docs[str(permission)] = api_docs
-            else:
-                per_permission_api_docs[str(permission)] = {}
-        # 从 workflow 文件中提取搜索字符串
-        derived_map: dict[str, list[str]] = {}
-        for permission, wf in per_permission_workflow.items():
-            search_strings = wf.get("search_strings")
-            if isinstance(search_strings, list) and search_strings:
-                derived_map[permission] = [str(s) for s in search_strings if str(s).strip()]
-            else:
-                derived_map[permission] = []
-        permission_search_map = derived_map
-
-    if not isinstance(permission_search_map, dict) or not permission_search_map:
-        raise RuntimeError(
-            "scan_manifest.json 未配置 permission_workflows 或 permission_search_map。\n"
-            "推荐使用 permission_workflows: {permission: workflow_json_path}"
-        )
+    if not isinstance(permission_workflows, dict) or not permission_workflows:
+        raise RuntimeError("scan_manifest.json 未配置 permission_workflows")
 
     recursion_limits = _get_recursion_limits(scan_manifest)
 
-    # Phase 0: 对每个权限用 get_permisson_methods 找到候选敏感调用点（method -> hit strings）
-    permission_methods: dict[str, dict[str, list[str]]] = collect_permission_methods(
-        apk_path=args.apk,
-        permission_search_map=permission_search_map,
-    )
-    if not any(permission_methods.values()):
-        print(json.dumps({}, ensure_ascii=False))
-        return
+    # load once, reuse instanceId
+    _log(f"[agent] load APK -> instanceId: {args.apk}")
+    instance_id = _jadx_load(jadx_daemon_url=jadx_daemon_url, apk_path=args.apk)
+    _log(f"[agent] instanceId={instance_id}")
 
-    agent = Agent(
-        model=OpenAIChat(
-            id=args.model,
-            base_url=args.base_url,
-            api_key=api_key
-        ),
-        tools=[mcp_tools],
-        markdown=True,
-        debug_mode=True,
-        system_message_role="user",
-    )
+    # LLM client (fallback when agno not installed)
+    llm_client: Optional[OpenAICompatClient] = None
+    if not _HAS_AGNO:
+        llm_client = OpenAICompatClient(base_url=llm_base_url, api_key=api_key, model=llm_model)
 
-    print("Starting agent with MCP tools...")
-    async with mcp_tools:
-        # We need to make sure tools are loaded before agent runs
-        # The context manager calls connect() which calls initialize() which calls build_tools()
-        # So mcp_tools.functions should be populated now.
-        print(f"Tools available: {len(mcp_tools.functions)}")
+    # 读取外部声明的使用场景（permission -> list[str]）
+    scenarios_by_permission: dict[str, Any] = {}
+    if os.path.exists(scenarios_path):
+        scenarios_by_permission = _read_json_file(scenarios_path)
 
-        # Phase 1: bootstrap load once, reuse instanceId
-        bootstrap_prompt = _build_bootstrap_prompt(args.apk)
-        bootstrap_resp = await agent.arun(bootstrap_prompt)
-        bootstrap_text = getattr(bootstrap_resp, "content", None) or str(bootstrap_resp)
-        bootstrap_json = _extract_first_json_object(bootstrap_text)
-        instance_id = str(bootstrap_json.get("instanceId") or "").strip()
-        if not instance_id:
-            raise RuntimeError("bootstrap 阶段未拿到有效 instanceId")
+    async def _run_with_agno():
+        assert _HAS_AGNO and mcp_tools is not None
+        assert Agent is not None
+        assert OpenAIChat is not None
+        agent = Agent(
+            model=OpenAIChat(
+                id=llm_model,
+                base_url=llm_base_url,
+                api_key=api_key,
+            ),
+            tools=[mcp_tools],
+            markdown=True,
+            debug_mode=True,
+            system_message_role="user",
+        )
 
-        # Phase 2: 递归上溯调用链，直到顶层非通用接口
-        analysis_cache: dict[str, dict[str, Any]] = {}
-        analyzed_count = 0
+        print("Starting agent with MCP tools...")
+        async with mcp_tools:
+            print(f"Tools available: {len(mcp_tools.functions)}")
+            async def agent_call(prompt: str):
+                return await agent.arun(prompt)
 
-        async def analyze_method(method_sig: str) -> dict[str, Any]:
-            nonlocal analyzed_count
-            if method_sig in analysis_cache:
-                return analysis_cache[method_sig]
-            if analyzed_count >= recursion_limits["max_total_methods"]:
-                result = {
-                    "entry_point": method_sig,
-                    "is_wrapper_interface": None,
-                    "confidence": 0.0,
-                    "evidence": [
-                        f"达到分析上限 max_total_methods={recursion_limits['max_total_methods']}，停止继续分析",
-                    ],
-                    "callers": [],
-                }
-                analysis_cache[method_sig] = result
-                return result
+            await _run_all_permissions(agent_call=agent_call)
 
-            scan_vars = {
-                "input_file": args.apk,
-                "priscan_workflow": args.workflow,
-                "instanceId": instance_id,
-                "entry_point": str(method_sig),
-            }
-            scan_prompt = _build_scan_prompt(scan_manifest, scan_vars)
-            scan_resp = await agent.arun(scan_prompt)
-            scan_text = getattr(scan_resp, "content", None) or str(scan_resp)
+    async def _run_without_agno():
+        client = llm_client
+        assert client is not None
 
-            parsed: dict[str, Any] = {
-                "entry_point": method_sig,
-                "is_wrapper_interface": None,
-                "confidence": None,
-                "evidence": ["模型输出无法解析为 JSON", scan_text[:5000]],
-                "callers": [],
-            }
-            try:
-                scan_json = _extract_first_json_object(scan_text)
-                parsed["entry_point"] = scan_json.get("entry_point") or method_sig
-                parsed["is_wrapper_interface"] = _as_bool_or_none(scan_json.get("is_wrapper_interface"))
-                parsed["confidence"] = scan_json.get("confidence")
-                parsed["evidence"] = scan_json.get("evidence") or []
-                callers = scan_json.get("callers")
-                if isinstance(callers, list):
-                    parsed["callers"] = [str(c) for c in callers][: recursion_limits["max_callers_per_method"]]
-            except Exception:
-                pass
+        def agent_call(prompt: str):
+            return client.chat(prompt=prompt)
 
-            analyzed_count += 1
-            analysis_cache[method_sig] = parsed
-            return parsed
+        await _run_all_permissions(agent_call=agent_call)
 
-        final_report: dict[str, Any] = {}
+    async def _run_one_permission(*, permission: str, agent_call) -> tuple[str, dict[str, Any]] | None:
+        workflow_path = permission_workflows.get(permission)
+        if not workflow_path:
+            return None
 
-        for permission, methods_dict in permission_methods.items():
-            # 每个权限单独产出结果（但分析缓存跨权限复用）
-            roots: dict[str, Any] = {}
-            undetermined: list[dict[str, Any]] = []
+        _log(f"[agent] ===== permission={permission} =====")
 
-            # queue item: (current_method, origin_sensitive_method, wrapper_chain, depth)
-            queue: deque[tuple[str, str, list[dict[str, Any]], int]] = deque()
-            visited: set[tuple[str, str]] = set()
+        wf = _read_json_file(str(workflow_path))
+        search_strings = wf.get("search_strings") or []
+        if not isinstance(search_strings, list) or not search_strings:
+            return None
 
-            for origin_method, _hit_list in (methods_dict or {}).items():
-                queue.append((origin_method, origin_method, [], 0))
-                visited.add((origin_method, origin_method))
+        scenario_cfg = wf.get("scenario_check") or {}
+        scenario_prompt_template = scenario_cfg.get("system_prompt")
+        if not isinstance(scenario_prompt_template, str) or not scenario_prompt_template.strip():
+            return None
 
-            while queue:
-                current_method, origin_method, wrapper_chain, depth = queue.popleft()
-                analysis = await analyze_method(current_method)
+        api_docs_raw = wf.get("api_docs")
+        api_docs_all: dict[str, Any] = api_docs_raw if isinstance(api_docs_raw, dict) else {}
+        scenarios = scenarios_by_permission.get(permission)
+        if not isinstance(scenarios, list):
+            scenarios = []
 
-                is_wrapper = analysis.get("is_wrapper_interface")
-                if is_wrapper is True:
-                    if depth >= recursion_limits["max_depth"]:
-                        undetermined.append(
-                            {
-                                "origin": origin_method,
-                                "reason": f"达到 max_depth={recursion_limits['max_depth']}，停止上溯",
-                                "last_method": current_method,
-                                "wrapper_chain": wrapper_chain
-                                + [
-                                    {
-                                        "method": current_method,
-                                        "evidence": analysis.get("evidence"),
-                                        "confidence": analysis.get("confidence"),
-                                    }
-                                ],
-                                "hits": methods_dict.get(origin_method, []),
-                            }
-                        )
-                        continue
+        # 每次只传入一个大权限的 map，避免混淆
+        permission_search_map = {permission: [str(s) for s in search_strings if str(s).strip()]}
+        _log(f"[agent] extract call graph: permission={permission} search_strings={len(permission_search_map[permission])}")
+        extracted = collect_permission_methods(
+            apk_path=args.apk,
+            permission_search_map=permission_search_map,
+            instance_id=instance_id,
+            recursion_limits=recursion_limits,
+            base_url=jadx_daemon_url,
+            verbose=True,
+        )
+        perm_obj = (extracted.get("by_permission") or {}).get(permission) or {}
+        if not isinstance(perm_obj, dict) or not (perm_obj.get("hits") and perm_obj.get("roots_index")):
+            return (
+                permission,
+                {
+                    "extracted": perm_obj,
+                    "scenario_results": {},
+                },
+            )
 
-                    new_chain = wrapper_chain + [
-                        {
-                            "method": current_method,
-                            "evidence": analysis.get("evidence"),
-                            "confidence": analysis.get("confidence"),
-                        }
-                    ]
-                    callers: list[str] = analysis.get("callers") or []
-                    if not callers:
-                        undetermined.append(
-                            {
-                                "origin": origin_method,
-                                "reason": "被判定为通用封装接口，但无法获取调用者，无法继续上溯",
-                                "last_method": current_method,
-                                "wrapper_chain": new_chain,
-                                "hits": methods_dict.get(origin_method, []),
-                            }
-                        )
-                        continue
+        hits = perm_obj.get("hits") or {}
+        roots_index = perm_obj.get("roots_index") or {}
+        call_graph = perm_obj.get("call_graph") or {}
 
-                    for caller in callers:
-                        key = (caller, origin_method)
-                        if key in visited:
-                            continue
-                        visited.add(key)
-                        queue.append((caller, origin_method, new_chain, depth + 1))
+        _log(
+            f"[agent] extracted: permission={permission} hits={len(hits)} roots={len(roots_index)} edges={len((call_graph or {}).get('edges') or [])}"
+        )
 
-                elif is_wrapper is False:
-                    root_method = current_method
-                    roots.setdefault(root_method, {"origins": []})
-                    roots[root_method]["origins"].append(
-                        {
-                            "origin": origin_method,
-                            "hits": methods_dict.get(origin_method, []),
-                            "wrapper_chain": wrapper_chain,
-                            "analysis": {
-                                "is_wrapper_interface": False,
-                                "confidence": analysis.get("confidence"),
-                                "evidence": analysis.get("evidence"),
-                            },
-                            "call_chain": [
-                                origin_method,
-                                *[w["method"] for w in wrapper_chain],
-                                root_method,
-                            ],
-                        }
-                    )
-                else:
-                    undetermined.append(
-                        {
-                            "origin": origin_method,
-                            "reason": "无法判定 is_wrapper_interface",
-                            "last_method": current_method,
-                            "wrapper_chain": wrapper_chain,
-                            "hits": methods_dict.get(origin_method, []),
-                            "evidence": analysis.get("evidence"),
-                        }
-                    )
+        global_prefix = _build_global_scenario_prefix(scan_manifest)
+        effective_template = f"{global_prefix}\n\n{scenario_prompt_template}"
 
-            final_report[permission] = {
-                "roots": roots,
-                "undetermined": undetermined,
-            }
+        perm_report: dict[str, Any] = {
+            "extracted": {
+                "hits": hits,
+                "call_graph": call_graph,
+                "roots_index": roots_index,
+            },
+            "scenario_results": {},
+        }
 
-        # Phase 3 (optional): 使用场景符合性审计
-        scenarios_by_permission: dict[str, Any] = {}
-        if args.scenarios:
-            scenarios_by_permission = _read_json_file(args.scenarios)
-
-        if scenarios_by_permission:
-            for permission, payload in final_report.items():
-                scenarios = scenarios_by_permission.get(permission)
-                if not isinstance(scenarios, list) or not scenarios:
-                    continue
-
-                wf = per_permission_workflow.get(permission) or {}
-                scenario_cfg = wf.get("scenario_check") or {}
-                scenario_prompt_template = scenario_cfg.get("system_prompt")
-                if not isinstance(scenario_prompt_template, str) or not scenario_prompt_template.strip():
-                    # 没有配置场景工作流则跳过
-                    continue
-
-                roots_obj = payload.get("roots") or {}
-                for root_method, root_info in roots_obj.items():
-                    # 根据 origins 的 hits 计算需要注入的 API 文档（只注入命中的那部分）
-                    api_docs_all = per_permission_api_docs.get(permission) or {}
-                    hit_strings: set[str] = set()
-                    for origin_item in (root_info.get("origins") or []):
-                        for s in (origin_item.get("hits") or []):
+        root_items = list((roots_index or {}).items())
+        for idx, (root_method, root_info) in enumerate(root_items, start=1):
+            _log(f"[agent] scenario_check {permission}: {idx}/{len(root_items)} root={root_method}")
+            # 只注入命中的 API docs
+            hit_strings: set[str] = set()
+            sink_hits = (root_info or {}).get("sink_hits") or {}
+            if isinstance(sink_hits, dict):
+                for _sink, arr in sink_hits.items():
+                    if isinstance(arr, list):
+                        for s in arr:
                             hit_strings.add(str(s))
-                    api_docs_used = {k: api_docs_all.get(k) for k in hit_strings if api_docs_all.get(k) is not None}
+            api_docs_used = {k: api_docs_all.get(k) for k in hit_strings if api_docs_all.get(k) is not None}
 
-                    context_obj = {
-                        "permission": permission,
-                        "root_method": root_method,
-                        "origins": root_info.get("origins") or [],
-                        "api_hits": sorted(list(hit_strings)),
-                    }
-                    variables = {
-                        "input_file": args.apk,
-                        "instanceId": instance_id,
-                        "permission": permission,
-                        "entry_point": root_method,
-                        "scenarios_json": json.dumps(scenarios, ensure_ascii=False),
-                        "context_json": json.dumps(context_obj, ensure_ascii=False),
-                        "api_docs_json": json.dumps(api_docs_used, ensure_ascii=False),
-                    }
-                    scenario_prompt = _build_scenario_prompt(
-                        system_prompt=scenario_prompt_template,
-                        rules=scan_manifest.get("rules", []),
-                        variables=variables,
-                    )
+            context_obj = {
+                "permission": permission,
+                "root_method": root_method,
+                "sinks": (root_info or {}).get("sinks") or [],
+                "sink_hits": sink_hits,
+                "paths": (root_info or {}).get("paths") or [],
+                "graph_limits": (call_graph or {}).get("limits") or {},
+                "notice": "context_json 为自动预提取线索，可能不完整；需要用 JADX MCP 扩展验证",
+            }
 
-                    resp = await agent.arun(scenario_prompt)
-                    txt = getattr(resp, "content", None) or str(resp)
-                    scenario_result: dict[str, Any]
-                    try:
-                        scenario_result = _extract_first_json_object(txt)
-                    except Exception:
-                        scenario_result = {
-                            "entry_point": root_method,
-                            "permission": permission,
-                            "verdict": "无法判定",
-                            "matched_scenarios": [],
-                            "confidence": 0.0,
-                            "evidence": ["模型输出无法解析为 JSON", txt[:5000]],
-                            "issues": ["模型输出格式错误"],
-                        }
+            variables = {
+                "input_file": args.apk,
+                "instanceId": instance_id,
+                "permission": permission,
+                "entry_point": root_method,
+                "scenarios_json": json.dumps(scenarios, ensure_ascii=False),
+                "context_json": json.dumps(context_obj, ensure_ascii=False),
+                "api_docs_json": json.dumps(api_docs_used, ensure_ascii=False),
+            }
+            scenario_prompt = _build_scenario_prompt(
+                system_prompt=effective_template,
+                rules=scan_manifest.get("rules", []),
+                variables=variables,
+            )
 
-                    root_info["scenario_check"] = scenario_result
+            resp = agent_call(scenario_prompt)
+            if asyncio.iscoroutine(resp):
+                resp = await resp
+            txt = getattr(resp, "content", None) or str(resp)
+            try:
+                scenario_result = _extract_first_json_object(txt)
+            except Exception:
+                scenario_result = {
+                    "entry_point": root_method,
+                    "permission": permission,
+                    "verdict": "无法判定",
+                    "matched_scenarios": [],
+                    "confidence": 0.0,
+                    "evidence": ["模型输出无法解析为 JSON", txt[:5000]],
+                    "issues": ["模型输出格式错误"],
+                }
+
+            perm_report["scenario_results"][root_method] = scenario_result
+
+        return permission, perm_report
+
+    async def _run_all_permissions(agent_call):
+        final_report: dict[str, Any] = {
+            "instanceId": instance_id,
+            "apk": args.apk,
+            "by_permission": {},
+        }
+
+        for permission in PERMISSION_ORDER:
+            item = await _run_one_permission(permission=permission, agent_call=agent_call)
+            if not item:
+                continue
+            perm, report = item
+            final_report["by_permission"][perm] = report
 
         print(json.dumps(final_report, ensure_ascii=False))
+
+    if _HAS_AGNO:
+        await _run_with_agno()
+    else:
+        await _run_without_agno()
 
 if __name__ == "__main__":
     asyncio.run(main())
