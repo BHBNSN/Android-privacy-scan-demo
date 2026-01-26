@@ -4,7 +4,6 @@
   "search_strings": [
     "ClipboardManager",
     "getPrimaryClip(",
-    "getText(",
     "getPrimaryClipDescription("
   ],
   "api_docs": {
@@ -21,13 +20,6 @@
       "outputs": "ClipData：剪贴板当前主内容",
       "meaning": "读取剪贴板内容载体（可能包含文本、URI、Intent 等）。",
       "notes": "敏感：可能包含用户隐私/验证码/账号信息；重点看触发条件、是否上传/记录。"
-    },
-    "getText(": {
-      "api": "android.content.ClipData.Item#getText()",
-      "inputs": "ClipData.Item",
-      "outputs": "CharSequence：剪贴板文本（若存在）",
-      "meaning": "从剪贴板条目中取出文本内容。",
-      "notes": "敏感：直接得到可读文本；需要审计是否在后台/无交互场景读取。"
     },
     "getPrimaryClipDescription(": {
       "api": "android.content.ClipboardManager#getPrimaryClipDescription()",

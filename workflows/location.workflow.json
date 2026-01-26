@@ -2,10 +2,9 @@
   "version": 1,
   "permission": "location",
   "search_strings": [
-    "location.getProvider",
-    "getLatitude(",
-    "getLongitude(",
-    "getAltitude("
+    "LocationManager ",
+    "(LocationManager)"
+    
   ],
   "api_docs": {
     "location.getProvider": {
